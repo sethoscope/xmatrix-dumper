@@ -47,6 +47,14 @@
  *
  *     ==========================================================
  *
+ * This version has been hacked to write each frame to an XPM file,
+ * rather than display anything interesting on the screen.  It's rough
+ * around the edges (you get a blank window, it would be nicer to draw
+ * both to the window and the pixmap), but it gets the job done.
+ * 
+ * Written 2014-01-12, Seth Golub <seth@sethoscope.net>
+ * 
+ * 
  */
 
 #ifdef HAVE_UNISTD_H
@@ -58,6 +66,8 @@
 #include "xpm-pixmap.h"
 #include <stdio.h>
 #include <sys/wait.h>
+#include <X11/xpm.h>
+#include <limits.h>
 
 #ifdef HAVE_COCOA
 # define HAVE_XPM
@@ -176,7 +186,9 @@ typedef enum { DRAIN_TRACE_A,
 typedef struct {
   Display *dpy;
   Window window;
+  Pixmap pixmap;
   XWindowAttributes xgwa;
+  XWindowAttributes pixmap_attr;
   GC draw_gc, erase_gc, scratch_gc;
   int grid_width, grid_height;
   int char_width, char_height;
@@ -228,6 +240,7 @@ typedef struct {
 
   unsigned long colors[5];
   int delay;
+  const char *output_file_pattern;
 } m_state;
 
 
@@ -275,6 +288,48 @@ load_images (Display *dpy, m_state *state)
 {
   load_images_1 (dpy, state, 1);
   load_images_1 (dpy, state, 2);
+}
+
+
+static char *
+output_image_filename (const char *file_pattern)
+{
+  static int counter = 1;
+  const int maxlen = PATH_MAX;  /* from limits.h */
+  static char *outfile = NULL;
+  fprintf (stderr, "file pattern: %s\n", file_pattern);
+
+  if ( outfile == NULL ) {
+    outfile = malloc(maxlen);
+  }
+
+  if ( counter > 9999 ) {
+    exit (9);
+  }
+  snprintf(outfile, maxlen, file_pattern, counter);
+
+  ++counter;
+  return outfile;
+}
+
+
+static void
+write_image (m_state *state)
+{
+  char *filename;
+  XImage *im;
+  filename = output_image_filename(state->output_file_pattern);
+  im = XGetImage(state->dpy, state->pixmap, 0, 0,
+                 state->pixmap_attr.width, state->pixmap_attr.height,
+                 ~0L, (state->pixmap_attr.depth > 1 ? ZPixmap : XYPixmap));
+
+  if ( XpmWriteFileFromImage (state->dpy, filename, im, NULL, NULL)
+       != XpmSuccess )
+    {
+      fprintf (stderr, "xpm write failed.\n");
+      exit (2);
+    }
+  fprintf (stderr, "wrote to %s.\n" , filename);
 }
 
 
@@ -608,8 +663,16 @@ xmatrix_init (Display *dpy, Window window)
   state->delay = get_integer_resource (dpy, "delay", "Integer");
 
   XGetWindowAttributes (dpy, window, &state->xgwa);
+  XGetWindowAttributes (dpy, window, &state->pixmap_attr);
 
-  state->small_p = (state->xgwa.width < 300);
+  state->pixmap_attr.width  = get_integer_resource (dpy, "width", "Integer");
+  state->pixmap_attr.height = get_integer_resource (dpy, "height", "Integer");
+  state->pixmap = XCreatePixmap(dpy, window,
+                                state->pixmap_attr.width,
+                                state->pixmap_attr.height,
+                                state->pixmap_attr.depth);
+
+  state->small_p = (state->pixmap_attr.width < 300);
   {
     const char *s = get_string_resource (dpy, "matrixFont", "String");
     if (!s || !*s || !strcasecmp(s, "large"))
@@ -627,15 +690,24 @@ xmatrix_init (Display *dpy, Window window)
                                       "foreground", "Foreground");
   gcv.background = get_pixel_resource(state->dpy, state->xgwa.colormap,
                                       "background", "Background");
-  state->draw_gc = XCreateGC (state->dpy, state->window,
+  state->draw_gc = XCreateGC (state->dpy, state->pixmap,
                               GCForeground|GCBackground, &gcv);
   gcv.foreground = gcv.background;
-  state->erase_gc = XCreateGC (state->dpy, state->window,
+  state->erase_gc = XCreateGC (state->dpy, state->pixmap,
                                GCForeground|GCBackground, &gcv);
 
-  state->scratch_gc = XCreateGC (state->dpy, state->window, 0, &gcv);
+  state->scratch_gc = XCreateGC (state->dpy, state->pixmap, 0, &gcv);
 
-  /* Allocate colors for SYSTEM FAILURE box */
+  fprintf (stderr, "get ready\n");
+  state->output_file_pattern = get_string_resource (dpy, "outfile", "String");
+  fprintf (stderr, "outfile: %s\n", state->output_file_pattern);
+  if ( strnlen( state->output_file_pattern, PATH_MAX+1 ) == PATH_MAX+1 )
+    {
+      fprintf (stderr, "outfile name is too long.\n");
+      exit(3);
+    }
+
+/* Allocate colors for SYSTEM FAILURE box */
   {
     XColor boxcolors[] = {
       { 0, 0x0808, 0x1E1E, 0x0808, DoRed|DoGreen|DoBlue, 0 },
@@ -656,8 +728,8 @@ xmatrix_init (Display *dpy, Window window)
   state->char_width =  state->image_width  / CHAR_COLS;
   state->char_height = state->image_height / CHAR_ROWS;
 
-  state->grid_width  = state->xgwa.width  / state->char_width;
-  state->grid_height = state->xgwa.height / state->char_height;
+  state->grid_width  = state->pixmap_attr.width  / state->char_width;
+  state->grid_height = state->pixmap_attr.height / state->char_height;
   state->grid_width++;
   state->grid_height++;
   if (state->grid_width  < 5) state->grid_width  = 5;
@@ -1039,7 +1111,7 @@ redraw_cells (m_state *state, Bool active)
 
 
         if (cell->glyph == 0 && !cursor_p && !use_back_p)
-          XFillRectangle (state->dpy, state->window, state->erase_gc,
+          XFillRectangle (state->dpy, state->pixmap, state->erase_gc,
                           x * state->char_width,
                           y * state->char_height,
                           state->char_width,
@@ -1053,7 +1125,7 @@ redraw_cells (m_state *state, Bool active)
                        PLAIN_MAP);
 
             XCopyArea (state->dpy, state->images[map],
-                       state->window, state->draw_gc,
+                       state->pixmap, state->draw_gc,
                        cx * state->char_width,
                        cy * state->char_height,
                        state->char_width,
@@ -1159,7 +1231,7 @@ hack_text (m_state *state)
             if (cy < 0) cy = 0;
             if (cx < 0) cx = 0;
 
-            XFillRectangle (state->dpy, state->window, state->erase_gc,
+            XFillRectangle (state->dpy, state->pixmap, state->erase_gc,
                             cx * state->char_width,
                             cy * state->char_height,
                             strlen(s) * state->char_width,
@@ -1170,7 +1242,7 @@ hack_text (m_state *state)
                 XGCValues gcv;
                 gcv.foreground = state->colors[i + 2];
                 XChangeGC (state->dpy, state->scratch_gc, GCForeground, &gcv);
-                XDrawRectangle (state->dpy, state->window, state->scratch_gc,
+                XDrawRectangle (state->dpy, state->pixmap, state->scratch_gc,
                                 cx * state->char_width - i,
                                 cy * state->char_height - i,
                                 strlen(s) * state->char_width + (2 * i),
@@ -1633,6 +1705,7 @@ xmatrix_draw (Display *dpy, Window window, void *closure)
     }
 
   redraw_cells (state, True);
+  write_image (state);
 
 #if 0
   {
@@ -1665,8 +1738,8 @@ xmatrix_reshape (Display *dpy, Window window, void *closure,
   int ow = state->grid_width;
   int oh = state->grid_height;
   XGetWindowAttributes (state->dpy, state->window, &state->xgwa);
-  state->grid_width  = state->xgwa.width  / state->char_width;
-  state->grid_height = state->xgwa.height / state->char_height;
+  state->grid_width  = state->pixmap_attr.width  / state->char_width;
+  state->grid_height = state->pixmap_attr.height / state->char_height;
   state->grid_width++;
   state->grid_height++;
   if (state->grid_width  < 5) state->grid_width  = 5;
@@ -1683,8 +1756,8 @@ xmatrix_reshape (Display *dpy, Window window, void *closure,
         calloc (sizeof(m_feeder), state->grid_width);
       int x, y, i;
 
-      /* fprintf(stderr, "resize: %d x %d  ==>  %d x %d\n",
-         ow, oh, state->grid_width, state->grid_height); */
+      fprintf(stderr, "resize: %d x %d  ==>  %d x %d\n",
+              ow, oh, state->grid_width, state->grid_height);
 
       for (y = 0; y < oh; y++)
         for (x = 0; x < ow; x++)
@@ -1818,7 +1891,10 @@ static const char *xmatrix_defaults [] = {
   "*usePipe:		   False",
   "*usePty:                False",
   "*program:		   xscreensaver-text",
-  "*geometry:		   800x600",
+  "*geometry:		   200x200",
+  "*width:		   400", /* for pixmap output */
+  "*height:		   300", /* for pixmap output */
+  "*outfile:		   /tmp/xmatrix-%05d.xpm", /* for pixmap output */
   0
 };
 
@@ -1846,6 +1922,9 @@ static XrmOptionDescRec xmatrix_options [] = {
   { "-pipe",	        ".usePipe",		XrmoptionNoArg, "True" },
   { "-no-pipe",	        ".usePipe",		XrmoptionNoArg, "False" },
   { "-program",	        ".program",		XrmoptionSepArg, 0 },
+  { "-width",		".width",		XrmoptionSepArg, 0 },
+  { "-height",		".height",		XrmoptionSepArg, 0 },
+  { "-outfile",		".outfile",		XrmoptionSepArg, 0 },
   { 0, 0, 0, 0 }
 };
 
